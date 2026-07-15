@@ -67,8 +67,13 @@ macro_rules! info_with_replica {
 
 struct ManagerState {
     checkpoint_metadata: HashMap<i64, String>,
-    channel: broadcast::Sender<Quorum>,
+    // Broadcasts each quorum round's outcome to every waiting rank. Carries
+    // Result so a failed round REPORTS instead of hanging its waiters.
+    channel: broadcast::Sender<Result<Quorum, String>>,
     participants: HashMap<i64, QuorumMember>,
+    // True from round trigger until its broadcast. Guards against a second
+    // round triggering off stale bookkeeping while one is in flight.
+    quorum_round_in_flight: bool,
 
     should_commit_channel: broadcast::Sender<bool>,
     should_commit_failures: HashSet<i64>,
@@ -147,6 +152,7 @@ impl Manager {
                 checkpoint_metadata: HashMap::new(),
                 channel: tx,
                 participants: HashMap::new(),
+                quorum_round_in_flight: false,
 
                 should_commit_channel: should_commit_tx,
                 should_commit_count: HashSet::new(),
@@ -226,23 +232,34 @@ impl Manager {
             requester: Some(requester),
         };
 
-        let response = self
-            ._quorum_with_retries(timeout, lighthouse_request)
-            .await?;
+        let result: Result<Quorum, String> =
+            match self._quorum_with_retries(timeout, lighthouse_request).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    info_with_replica!(self.replica_id, "got lighthouse quorum {:?}", resp);
+                    resp.quorum.ok_or_else(|| "missing quorum".to_string())
+                }
+                Err(e) => Err(format!("lighthouse quorum round failed: {}", e)),
+            };
 
-        let resp = response.into_inner();
-
-        info_with_replica!(self.replica_id, "got lighthouse quorum {:?}", resp);
-
-        let state = self.state.lock().await;
-        // TODO: We don't broadcast in cases when this method returns an error, resulting in a hang
+        let mut state = self.state.lock().await;
+        // Broadcast-time bookkeeping: everyone cleared here subscribed before
+        // this send (insert/subscribe and send are serialized by the state
+        // lock), so bookkeeping and delivery stay consistent -- no ghosts.
+        // Errors are broadcast too, so a failed round reports to its waiters
+        // instead of hanging them (the old TODO).
+        state.participants.clear();
+        state.quorum_round_in_flight = false;
+        let is_err = result.is_err();
         state
             .channel
-            .send(
-                resp.quorum
-                    .ok_or_else(|| Status::internal("missing quorum"))?,
-            )
+            .send(result)
             .map_err(|e| Status::from_error(e.into()))?;
+        if is_err {
+            return Err(Status::internal(
+                "quorum round failed; error broadcast to waiters",
+            ));
+        }
 
         Ok(())
     }
@@ -374,8 +391,20 @@ impl ManagerService for Arc<Manager> {
             state.participants.insert(group_rank, member.clone());
             let rx = state.channel.subscribe();
 
-            if (state.participants.len() as u64) == self.world_size {
-                state.participants.clear();
+            // Trigger a round only when a full FRESH cohort is present and no
+            // round is already in flight. participants is NOT cleared here:
+            // clearing happens at broadcast time (see _run_quorum), under this
+            // same lock as insert/subscribe/send -- so the entries removed are
+            // exactly the requests served by that broadcast, mid-round
+            // arrivals included. Clearing at trigger (the old behavior) left
+            // "ghost" entries for requests that arrived while a round was in
+            // flight: served by the in-flight broadcast but still counted
+            // toward the next round, eventually triggering a phantom round
+            // with fewer real waiters than world_size that could never
+            // complete.
+            if !state.quorum_round_in_flight && (state.participants.len() as u64) == self.world_size
+            {
+                state.quorum_round_in_flight = true;
                 let self_clone = self.clone();
                 tokio::spawn(async move {
                     let _ = self_clone._run_quorum(member, timeout).await;
@@ -388,7 +417,8 @@ impl ManagerService for Arc<Manager> {
         let quorum = rx
             .recv()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|e| Status::internal(e))?;
 
         info_with_replica!(
             self.replica_id,
@@ -698,6 +728,86 @@ mod tests {
         manager_fut.abort();
         lighthouse_fut.abort();
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_quorum_round_reports_instead_of_hanging() -> Result<()> {
+        // Regression: a round whose lighthouse call fails must BROADCAST the
+        // error to every waiter. The old code returned early without sending,
+        // stranding all waiting ranks until their own client deadlines (the
+        // documented TODO). Setup: the lighthouse requires 2 replicas but only
+        // one exists, so the round can never form; rank 1 triggers the round
+        // with a SHORT deadline (which bounds the round's lighthouse attempt),
+        // rank 0 waits with a LONG one. With the fix rank 0 receives the
+        // broadcast error at ~the short deadline; the old code left it hanging
+        // to its own 30s deadline.
+        let lighthouse = Lighthouse::new(LighthouseOpt {
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 100,
+            min_replicas: 2,
+            quorum_tick_ms: 100,
+            heartbeat_timeout_ms: 5000,
+        })
+        .await?;
+        let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
+
+        let manager = Manager::new(
+            "rep_id".to_string(),
+            lighthouse.address(),
+            "localhost".to_string(),
+            "[::]:0".to_string(),
+            "store_addr".to_string(),
+            2,                          // world size
+            Duration::from_millis(100), // heartbeat interval
+            Duration::from_secs(10),    // connect timeout
+            0,                          // quorum retries
+        )
+        .await?;
+        let manager_fut = tokio::spawn(manager.clone().run());
+
+        // Rank 0: long deadline; must NOT be left to hit it.
+        let addr = manager.address();
+        let waiter = tokio::spawn(async move {
+            let mut client = manager_client_new(addr, Duration::from_secs(10)).await?;
+            let mut request = tonic::Request::new(ManagerQuorumRequest {
+                group_rank: 0,
+                step: 1,
+                checkpoint_metadata: "addr0".to_string(),
+                shrink_only: false,
+                init_sync: true,
+                commit_failures: 0,
+            });
+            request.set_timeout(Duration::from_secs(30));
+            let start = std::time::Instant::now();
+            let result = client.quorum(request).await;
+            Ok::<_, anyhow::Error>((result.is_err(), start.elapsed()))
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Rank 1: triggers the round; its short deadline bounds the round.
+        let mut client = manager_client_new(manager.address(), Duration::from_secs(10)).await?;
+        let mut request = tonic::Request::new(ManagerQuorumRequest {
+            group_rank: 1,
+            step: 1,
+            checkpoint_metadata: "addr1".to_string(),
+            shrink_only: false,
+            init_sync: true,
+            commit_failures: 0,
+        });
+        request.set_timeout(Duration::from_secs(3));
+        let _ = client.quorum(request).await; // fails either way
+
+        let (waiter_errored, waiter_elapsed) = waiter.await??;
+        manager_fut.abort();
+        lighthouse_fut.abort();
+
+        assert!(waiter_errored, "waiter must receive the broadcast error");
+        assert!(
+            waiter_elapsed < Duration::from_secs(25),
+            "error must come from the round's broadcast (~3s), not the waiter's own 30s deadline; got {:?}",
+            waiter_elapsed
+        );
         Ok(())
     }
 
