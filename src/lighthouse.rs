@@ -302,6 +302,19 @@ impl Lighthouse {
                 .map(|p| p.replica_id.clone())
                 .collect();
 
+            // A quorum containing a BEHIND replica is a healing quorum: the
+            // joiner recovers state and then participates -- but its position
+            // in the manager ProcessGroup's collective sequence differs from
+            // the up-to-date replicas (they posted ops while it healed). On a
+            // long-lived NCCL comm that sequence skew never reconciles and the
+            // first post-heal collective hangs to the watchdog timeout. Bump
+            // the quorum_id so every rank reconfigures onto a FRESH comm and
+            // sequences restart together. Real joins get this for free from
+            // the membership change; the same-membership heal (a replica that
+            // skipped a commit, or a rejoin faster than the shrink) did not.
+            let max_step = participants.iter().map(|p| p.step).max().unwrap_or(0);
+            let needs_heal = participants.iter().any(|p| p.step != max_step);
+
             // only increment quorum ID if something about the quorum
             // changed (members/addresses/etc)
             if state.prev_quorum.is_none()
@@ -314,6 +327,12 @@ impl Lighthouse {
                 info!(
                     "Detected quorum change, bumping quorum_id to {}",
                     state.quorum_id
+                );
+            } else if needs_heal {
+                state.quorum_id += 1;
+                info!(
+                    "Healing quorum (a participant is behind max_step={}), bumping quorum_id to {}",
+                    max_step, state.quorum_id
                 );
             } else if commit_failure_replica_ids.len() > 0 {
                 state.quorum_id += 1;
